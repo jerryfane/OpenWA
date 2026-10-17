@@ -1,4 +1,4 @@
-import { type Client, MessageTypes } from 'whatsapp-web.js';
+import type { Client } from 'whatsapp-web.js';
 import {
   type IncomingMessage,
   type RevokedMessage,
@@ -40,17 +40,6 @@ export function registerWwebjsMessageEvents(client: Client, host: WwebjsEngineHo
         }
       } catch (error) {
         host.logger.error('Error getting message contact', String(error));
-      }
-
-      // Handle location
-      if (msg.type === MessageTypes.LOCATION && msg.location) {
-        incomingMessage.location = {
-          latitude: Number(msg.location.latitude),
-          longitude: Number(msg.location.longitude),
-          description: msg.location.description || undefined,
-          address: msg.location.address || undefined,
-          url: msg.location.url || undefined,
-        };
       }
 
       // Handle media

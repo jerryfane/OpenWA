@@ -8,6 +8,7 @@ import {
   extractBaileysButtonReply,
   extractBaileysButtons,
   extractBaileysCommerce,
+  extractBaileysLocation,
   isBaileysCatalogShare,
 } from './baileys-message-mapper';
 import { BAILEYS_QUERY_BUDGET_MS, withQueryDeadline } from './baileys-query-deadline';
@@ -274,6 +275,7 @@ export class BaileysHistory {
         product: commerce.product,
         button,
         buttons,
+        location: extractBaileysLocation(content, contentType),
         isCatalogShare: isBaileysCatalogShare(content),
         // Populate the disappearing-messages timer using the same extraction the live path and the
         // session-store cache share (`msg.ephemeralDuration` primary, `contextInfo.expiration` fallback),
