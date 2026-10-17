@@ -1,4 +1,4 @@
-import { MessageMedia, MessageTypes, type Client, type Message } from 'whatsapp-web.js';
+import { MessageMedia, type Client, type Message } from 'whatsapp-web.js';
 import {
   CustomLinkPreview,
   IncomingMessage,
@@ -840,17 +840,7 @@ export class WwebjsMessaging {
       }
       const call = extractWwebjsCall(msg);
       if (call) out.call = call;
-      // Mirror the live handler's location + quoted-message enrichment so history renders identically —
-      // buildIncomingMessageBase sets type='location' but no coordinates, and never resolves quotes.
-      if (msg.type === MessageTypes.LOCATION && msg.location) {
-        out.location = {
-          latitude: Number(msg.location.latitude),
-          longitude: Number(msg.location.longitude),
-          description: msg.location.description || undefined,
-          address: msg.location.address || undefined,
-          url: msg.location.url || undefined,
-        };
-      }
+      // Resolve quotes asynchronously; the base builder already carries location coordinates.
       if (msg.hasQuotedMsg) {
         try {
           const quoted = await msg.getQuotedMessage();

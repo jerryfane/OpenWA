@@ -70,6 +70,13 @@ export interface RawMessageFields {
   type: string;
   timestamp: number;
   fromMe: boolean;
+  location?: {
+    latitude: string | number;
+    longitude: string | number;
+    description?: string;
+    address?: string;
+    url?: string;
+  };
   /** Set on group messages: the participant WID that actually sent the message. */
   author?: string;
   /** WIDs @mentioned in the message; whatsapp-web.js attaches this to every Message. */
@@ -156,6 +163,16 @@ export function buildIncomingMessageBase(msg: RawMessageFields): IncomingMessage
       ...(msg.title ? { title: msg.title } : {}),
       ...(msg.description ? { description: msg.description } : {}),
       ...(msg.businessOwnerJid ? { businessOwnerJid: msg.businessOwnerJid } : {}),
+    };
+  }
+
+  if (incoming.type === 'location' && msg.location) {
+    incoming.location = {
+      latitude: Number(msg.location.latitude),
+      longitude: Number(msg.location.longitude),
+      description: msg.location.description || undefined,
+      address: msg.location.address || undefined,
+      url: msg.location.url || undefined,
     };
   }
 
