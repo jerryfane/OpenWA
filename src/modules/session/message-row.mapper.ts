@@ -29,7 +29,7 @@ export const OMITTED_MEDIA = { mimetype: '', omitted: true } as const;
  *   and an empty object would be noise).
  */
 export function buildMessageMetadata(
-  message: Pick<IncomingMessage, 'media' | 'quotedMessage' | 'call' | 'buttons' | 'type'>,
+  message: Pick<IncomingMessage, 'media' | 'quotedMessage' | 'call' | 'buttons' | 'type' | 'location'>,
   synthesizeOmittedMedia = false,
 ): Record<string, unknown> | undefined {
   const metadata: Record<string, unknown> = {};
@@ -37,6 +37,9 @@ export function buildMessageMetadata(
     metadata.media = message.media;
   } else if (synthesizeOmittedMedia && MEDIA_MESSAGE_TYPES.has(message.type)) {
     metadata.media = { ...OMITTED_MEDIA };
+  }
+  if (message.location) {
+    metadata.location = message.location;
   }
   if (message.quotedMessage) {
     metadata.quotedMessage = message.quotedMessage;

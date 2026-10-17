@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Preserve location coordinates and supplied place details in `metadata.location` for stored messages, including live inbound messages and history ingestion. HTTP message history now retains location pins instead of dropping the payload; existing rows without coordinates cannot be reconstructed.
+
 ## [0.24.0] - 2026-10-03
 
 ### Added
