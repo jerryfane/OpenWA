@@ -1,6 +1,8 @@
-import { Injectable, BadRequestException, NotFoundException, Optional } from '@nestjs/common';
+import { Injectable, BadRequestException, NotFoundException, NotImplementedException, Optional } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { In, Repository } from 'typeorm';
+import { In, Not, Repository } from 'typeorm';
+import type { IncomingMessage } from '../../engine/interfaces/whatsapp-engine.interface';
+import { EngineNotReadyError } from '../../common/errors/engine-not-ready.error';
 import { EngineRegistry } from '../../engine/engine-registry.service';
 import { MessageProjector } from '../session/message-projector.service';
 import { SendTextMessageDto, SendMediaMessageDto, SendAudioMessageDto, MessageResponseDto } from './dto';
@@ -163,6 +165,8 @@ function inertMimetype(mimetype: string): string {
 @Injectable()
 export class MessageService implements PluginMessagePort {
   private readonly logger = createLogger('MessageService');
+  /** In-flight on-demand media downloads, by `sessionId:waMessageId` — see refetchChatMedia. */
+  private readonly mediaRefetches = new Map<string, Promise<{ buffer: Buffer; mimetype: string } | null>>();
 
   constructor(
     @InjectRepository(Message, 'data')
@@ -512,6 +516,10 @@ export class MessageService implements PluginMessagePort {
    * only a marker, which the REST-persisted copy covers) — #1165. It also serves an inbound message
    * whose archived file was purged by retention while the inline copy lives on.
    *
+   * When the row holds no payload at all — only the `omitted` marker an arrival download that failed
+   * or timed out leaves behind — the media is downloaded from the engine again on demand, kept on the
+   * row (and archived), and served; only when that also yields nothing is the answer a 404.
+   *
    * Unlike status media (only ever an image, a video or a voice note), chat media includes documents
    * a sender chose the type of — so the declared mimetype is echoed back only when it is inert, and the caller
    * serves the result as an attachment regardless. Both matter: an allow-list alone would still let
@@ -543,6 +551,12 @@ export class MessageService implements PluginMessagePort {
       where: { sessionId, chatId: In(chatIds), waMessageId: messageId },
     });
     const inline = (row?.metadata as { media?: { data?: unknown; mimetype?: unknown; omitted?: unknown } })?.media;
+    // The arrival download failed or timed out and left only the marker (or nothing): ask the engine
+    // again instead of 404ing for good. A URL send carries `data` and no marker, so it never gets here.
+    if (row && row.type !== 'revoked' && (!inline || inline.omitted)) {
+      const refetched = await this.refetchChatMedia(sessionId, row, messageId);
+      if (refetched) return refetched;
+    }
     if (
       // A revoked message's media is gone, even on a row cleared before revokes dropped it.
       row?.type === 'revoked' ||
@@ -560,6 +574,80 @@ export class MessageService implements PluginMessagePort {
       throw new NotFoundException('No media stored for this message');
     }
     return { buffer: Buffer.from(inline.data, 'base64'), mimetype: inertMimetype(inline.mimetype) };
+  }
+
+  /**
+   * Re-download a message's media from the engine and keep it, single-flight per message: a client
+   * retrying while the first download is still running joins it instead of queueing another, since
+   * each one holds an inbound media slot. Null when the engine has nothing to give (no live session,
+   * an engine without the capability, the message gone, the download failed again): the caller's 404.
+   * A transport failure (503) propagates so the caller can retry.
+   */
+  private refetchChatMedia(
+    sessionId: string,
+    row: Message,
+    messageId: string,
+  ): Promise<{ buffer: Buffer; mimetype: string } | null> {
+    const key = `${sessionId}:${messageId}`;
+    let pending = this.mediaRefetches.get(key);
+    if (!pending) {
+      pending = this.fetchAndStoreChatMedia(sessionId, row, messageId).finally(() => this.mediaRefetches.delete(key));
+      this.mediaRefetches.set(key, pending);
+    }
+    return pending;
+  }
+
+  private async fetchAndStoreChatMedia(
+    sessionId: string,
+    row: Message,
+    messageId: string,
+  ): Promise<{ buffer: Buffer; mimetype: string } | null> {
+    // No running session, or one not READY yet (409), has no engine to ask: the 404 as before.
+    const engine = this.engines.get(sessionId);
+    if (!engine) return null;
+    let media: IncomingMessage['media'] | null;
+    try {
+      media = await engine.fetchMessageMedia(row.chatId, messageId);
+    } catch (error) {
+      // 501 (the engine cannot) and 404 (the message is gone) also mean "no media", as before. A
+      // transport failure (503) is not an answer, so it reaches the caller.
+      if (
+        error instanceof EngineNotReadyError ||
+        error instanceof NotImplementedException ||
+        error instanceof NotFoundException
+      ) {
+        return null;
+      }
+      throw error;
+    }
+    if (!media || media.omitted || !media.data || !media.mimetype) return null;
+    const fetched = media;
+    const served = { buffer: Buffer.from(media.data, 'base64'), mimetype: inertMimetype(media.mimetype) };
+
+    // On the message's mutation chain, like every other writer of the row: a revoke queued first
+    // wins, and a reaction's read-modify-write of the same metadata column cannot be overwritten.
+    const revoked = await new Promise<boolean>(resolve =>
+      this.messageProjector.enqueueMessageMutation(sessionId, messageId, async () => {
+        try {
+          const current = await this.messageRepository.findOne({ where: { id: row.id } });
+          if (!current || current.type === 'revoked') return resolve(true);
+          const metadata = { ...current.metadata, media: fetched };
+          // Only the metadata column, so a concurrent ack UPDATE is not overwritten.
+          const result = await this.messageRepository.update({ id: row.id, type: Not('revoked') }, { metadata });
+          if (result.affected === 0) return resolve(true);
+          // Row first, then the file, as on arrival. A no-op unless archiving is enabled; never
+          // throws, and the read does not wait on it.
+          void this.chatMediaArchive?.archive({ ...current, metadata }).catch(() => undefined);
+          resolve(false);
+        } catch (error) {
+          // The bytes are good even if keeping them failed: serve them, and the next read re-fetches.
+          this.logger.warn(`Failed to store re-fetched media of message ${messageId}`, { error: String(error) });
+          resolve(false);
+        }
+      }),
+    );
+    if (revoked) return null;
+    return served;
   }
 
   /** Maximum messages a single getChatHistory call may request from the engine. */

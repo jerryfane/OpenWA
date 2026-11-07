@@ -1114,6 +1114,18 @@ export interface ChatHistoryCapability {
     mediaMaxBytes?: number,
     signal?: AbortSignal,
   ): Promise<IncomingMessage[]>;
+
+  /**
+   * Download one stored message's media again, on demand: the recovery path for a message whose
+   * arrival-time download failed or timed out and left only the `omitted` marker on its row. Returns
+   * the same envelope arrival produces (the payload, or the `omitted` marker when the download fails
+   * again or the media is over the cap), or null when the engine no longer has the message or it
+   * carries no media. Bounded by the same per-download limits as arrival (MEDIA_DOWNLOAD_MAX_BYTES,
+   * the inbound concurrency slots), and the lookup plus the download finish within one
+   * MEDIA_DOWNLOAD_TIMEOUT_MS; a page or socket that does not answer in time is an
+   * EngineTransportError (503), so the caller can retry.
+   */
+  fetchMessageMedia(chatId: string, messageId: string): Promise<IncomingMessage['media'] | null>;
 }
 
 /**

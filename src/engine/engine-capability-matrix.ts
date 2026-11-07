@@ -197,6 +197,12 @@ export const CURATED_CAPABILITY_EXCEPTIONS: Record<string, MethodCapability> = {
     evidence:
       'baileys only fetchMessageHistory(count,oldestKey,oldestTs) (Socket/business.d.ts:25) returns a sync-token string; messages arrive later via messaging-history.set event — no synchronous per-chat fetchMessages; wwjs Chat.fetchMessages (Chat.js)',
   },
+  fetchMessageMedia: {
+    wwjs: { status: 'supported' },
+    baileys: { status: 'supported' },
+    evidence:
+      'wwjs Client.getMessageById(serializedId) (Client.js:1751; throws page-side for a non-serialized id, so a bare id falls back to the Chat.fetchMessages window) → Message.downloadMedia via capInboundMediaFor; baileys the stored raw WAMessage (messageStore) → downloadMediaMessage with updateMediaMessage re-upload, the arrival path (baileys-events resolveInboundMedia). Null on Baileys without a messageStore',
+  },
   getChatLabels: {
     wwjs: { status: 'supported' },
     baileys: { status: 'not-available', rootCause: 'library-limitation' },
