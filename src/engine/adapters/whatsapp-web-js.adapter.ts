@@ -1,4 +1,5 @@
 import { EventEmitter } from 'events';
+import { EngineTransportError } from '../../common/errors/engine-transport.error';
 import { MessageMedia, type Client, type Message } from 'whatsapp-web.js';
 import {
   CallLinkType,
@@ -213,7 +214,8 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       reportIfPageTransportError: (error, context) => this.reportIfPageTransportError(error, context),
       ensureNotChannelRecipient: chatId => this.ensureNotChannelRecipient(chatId),
       getNumberId: number => this.getNumberId(number),
-      capInboundMediaFor: (msg, maxBytesOverride) => this.capInboundMediaFor(msg, maxBytesOverride),
+      capInboundMediaFor: (msg, maxBytesOverride, deadlineAt) =>
+        this.capInboundMediaFor(msg, maxBytesOverride, deadlineAt),
       config: this.config,
       getCallbacks: () => this.callbacks,
     };
@@ -283,10 +285,16 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
    * on the sender-declared size and skip the download entirely when it exceeds the cap, and (2) run the
    * download through the concurrency limiter for backpressure. Resolves an envelope whenever it has one
    * to build: the payload, or the declared-only marker when no blob is available.
+   *
+   * `deadlineAt` (epoch ms) is an on-demand caller's own deadline (fetchMessageMedia): the wait —
+   * queue included — ends then instead of a fresh MEDIA_DOWNLOAD_TIMEOUT_MS, work still queued at
+   * that point never starts downloadMedia, and missing it throws EngineTransportError rather than
+   * resolving the declared-only marker. Arrival callers omit it and keep the marker semantics.
    */
   private async capInboundMediaFor(
     msg: Message,
     maxBytesOverride?: number,
+    deadlineAt?: number,
   ): Promise<IncomingMessage['media'] | undefined> {
     if (!isMediaDownloadEnabled()) {
       return declaredOnlyMedia(msg);
@@ -325,7 +333,8 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     // later messages miss their own deadline. A download that already started is unaffected.
     let abandoned = false;
     const downloadInSlot = (): Promise<void> => {
-      if (abandoned) {
+      if (abandoned || (deadlineAt !== undefined && Date.now() >= deadlineAt)) {
+        abandoned = true;
         resolveBounded(null);
         return Promise.resolve();
       }
@@ -376,9 +385,11 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     // cannot cover the waiting. Without a bound here, a burst behind stuck slots parks forever and
     // those messages are never emitted AT ALL — strictly worse than the media loss this change set
     // out to fix. The old queue cap provided that degradation by rejecting; this restores it without
-    // shedding at a fixed batch size.
-    const media = await withInboundDownloadTimeout(boundedReady, inboundMediaTimeoutMs(), () => {
+    // shedding at a fixed batch size. An on-demand caller bounds the wait by its own deadline instead.
+    const waitMs = deadlineAt === undefined ? inboundMediaTimeoutMs() : Math.max(0, deadlineAt - Date.now());
+    const media = await withInboundDownloadTimeout(boundedReady, waitMs, () => {
       abandoned = true;
+      if (deadlineAt !== undefined) return;
       this.logger.warn(
         'Inbound media did not arrive within MEDIA_DOWNLOAD_TIMEOUT_MS; emitting message without media',
         {
@@ -387,6 +398,9 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       );
     });
     if (!media) {
+      if (abandoned && deadlineAt !== undefined) {
+        throw new EngineTransportError(`The media of message ${msgId} did not arrive within MEDIA_DOWNLOAD_TIMEOUT_MS`);
+      }
       return declaredOnlyMedia(msg);
     }
     const capped = capInboundMedia({
