@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Preserve location coordinates and supplied place details in `metadata.location` for stored messages, including live inbound messages and history ingestion. HTTP message history now retains location pins instead of dropping the payload; existing rows without coordinates cannot be reconstructed.
 - Carry coordinates out of Baileys history backfill and through the shared whatsapp-web.js live, own-send and history mapper. API-sent locations also retain their coordinates and supplied description/address in stored history.
+- `GET /sessions/:id/messages/:chatId/:messageId/media` no longer 404s for good when a message's media download failed or timed out on arrival (the row kept only the `omitted` marker): it downloads the media from the engine again on request, within one `MEDIA_DOWNLOAD_TIMEOUT_MS` and under the same size cap and inbound concurrency limits, keeps it on the row (and in the chat media archive when enabled) and serves it. Concurrent requests for the same message share one download; a download WhatsApp does not answer in time is a `503` to retry, and media that still cannot be downloaded remains a `404`. On Baileys this needs the message store.
 
 ## [0.24.0] - 2026-10-03
 

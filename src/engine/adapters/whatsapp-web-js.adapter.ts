@@ -727,6 +727,10 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     return this.messaging.getChatHistory(chatId, limit, includeMedia, mediaMaxBytes, signal);
   }
 
+  fetchMessageMedia(chatId: string, messageId: string): Promise<IncomingMessage['media'] | null> {
+    return this.messaging.fetchMessageMedia(chatId, messageId);
+  }
+
   starMessage(chatId: string, messageId: string, star: boolean): Promise<void> {
     return this.messaging.starMessage(chatId, messageId, star);
   }

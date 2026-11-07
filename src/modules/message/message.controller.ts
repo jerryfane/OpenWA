@@ -668,15 +668,25 @@ export class MessageController {
     status: 200,
     description:
       'The media bytes — the archived file when one exists, else the inline copy stored on the ' +
-      'message row (which is how media sent by this account is served) — as an attachment.',
+      'message row (which is how media sent by this account is served) — as an attachment. When the ' +
+      'row holds only the size-only marker (the download on arrival failed, timed out, or was over ' +
+      'the cap), the media is downloaded from WhatsApp again first, within one ' +
+      'MEDIA_DOWNLOAD_TIMEOUT_MS, and kept on the row for later reads.',
     content: { 'application/octet-stream': { schema: { type: 'string', format: 'binary' } } },
   })
   @ApiResponse({
     status: 404,
     description:
-      'No stored media for this message — it carries no media, media download was disabled or the ' +
-      'payload was over the cap when it was stored (size-only marker), it was a URL-based API send ' +
-      '(those bytes are never stored), or the message is not in this gateway’s history.',
+      'No media for this message — it carries no media, it was a URL-based API send (those bytes ' +
+      'are never stored), it was revoked, the message is not in this gateway’s history, or the ' +
+      'download on read also yielded nothing: the session is not running, its engine no longer has ' +
+      'the message, download is disabled, or the payload is over the cap.',
+  })
+  @ApiResponse({
+    status: 503,
+    description:
+      'The stored row holds no payload and WhatsApp did not answer the download on read within ' +
+      'MEDIA_DOWNLOAD_TIMEOUT_MS (or the session’s transport is down). Retry later.',
   })
   async getChatMedia(
     @Param('sessionId') sessionId: string,

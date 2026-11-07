@@ -844,6 +844,25 @@ export class BaileysMessaging {
   }
 
   /**
+   * Download one stored message's media again, on demand (see IWhatsAppEngine.fetchMessageMedia).
+   *
+   * The raw WAMessage the session stored on arrival still holds the media key and CDN path, so the
+   * inbound mapper re-runs the same capped download arrival ran — declared-size gate, inbound slots,
+   * MEDIA_DOWNLOAD_TIMEOUT_MS deadline, and the phone re-upload for media the CDN expired. The store
+   * is keyed by message id alone; the caller has already matched the id to its chat. Null without a
+   * store, for a message the store does not hold or that was deleted for everyone, and for a message
+   * with no media.
+   */
+  async fetchMessageMedia(_chatId: string, messageId: string): Promise<IncomingMessage['media'] | null> {
+    this.host.ensureReady();
+    const stored = await this.host.getStoredMessage(messageId);
+    if (!stored?.message || !stored.key || this.host.wasDeletedForEveryone(messageId)) return null;
+    const b = await this.host.loadLib();
+    const contentType = b.getContentType(b.normalizeMessageContent(stored.message) ?? stored.message);
+    return (await this.host.mapMessage(stored, contentType)).media ?? null;
+  }
+
+  /**
    * Turn an optional quoted-message id into Baileys' `quoted` send option.
    *
    * Baileys quotes by full stored message, never by id, so an id has to be resolved first — and an

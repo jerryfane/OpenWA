@@ -17,12 +17,15 @@ import { BadRequestException, NotImplementedException } from '@nestjs/common';
 import { MessageNotFoundError } from '../../common/errors/message-not-found.error';
 import { EngineRefusedError } from '../../common/errors/engine-refused.error';
 import { loadRemoteMediaBuffer } from '../../common/media/load-remote-media';
+import { EngineTransportError } from '../../common/errors/engine-transport.error';
 import { chatKind, userPart } from '../identity/wa-id';
 import {
   chatHistoryMediaBudgetBytes,
   coerceDeclaredSize,
   inboundMediaMaxBytes,
+  inboundMediaTimeoutMs,
   ingestMediaBudgetBytes,
+  withInboundDownloadTimeout,
 } from './inbound-media-cap';
 import { buildIncomingMessageBase, mapContactFields } from './message-mapper';
 import { buildVCard } from './vcard';
@@ -872,6 +875,54 @@ export class WwebjsMessaging {
       results.push(out);
     }
     return results;
+  }
+
+  /**
+   * Download one message's media again, on demand (see IWhatsAppEngine.fetchMessageMedia).
+   *
+   * The lookup is a page call bounded only by puppeteer's protocolTimeout (180 s by default), so the
+   * lookup and the download share ONE MEDIA_DOWNLOAD_TIMEOUT_MS deadline. Missing it is an
+   * EngineTransportError (503: WhatsApp Web left the query unanswered), never null, which the caller
+   * would read as "the media is gone". It is not reported as a page death: a slow page is not a dead one.
+   *
+   * The download goes through capInboundMediaFor, so the declared-size gate, the inbound concurrency
+   * slots shared with arrival traffic, and the size cap all apply unchanged.
+   */
+  async fetchMessageMedia(chatId: string, messageId: string): Promise<IncomingMessage['media'] | null> {
+    this.host.ensureReady();
+    const deadline = Date.now() + inboundMediaTimeoutMs();
+    const lookup = this.withPage('fetchMessageMedia', async () => {
+      // getMessageById reads the page store, then asks WhatsApp, by the full serialized id
+      // (`<fromMe>_<chat>_<id>[_<participant>]`) a stored row carries. It THROWS page-side for any
+      // other shape, so a bare id is looked up in the chat's recent window instead.
+      const parts = messageId.split('_').length;
+      if (parts === 3 || parts === 4) return this.client().getMessageById(messageId);
+      return this.findInFetchWindow(chatId, messageId).catch((error: unknown) => {
+        if (error instanceof MessageNotFoundError) return null;
+        throw error;
+      });
+    });
+    // Boxed so the timeout's null cannot be mistaken for "no such message".
+    const found = await withInboundDownloadTimeout(
+      lookup.then(message => ({ message })),
+      Math.max(0, deadline - Date.now()),
+    );
+    if (!found) {
+      throw new EngineTransportError(
+        `WhatsApp Web did not return message ${messageId} within MEDIA_DOWNLOAD_TIMEOUT_MS`,
+      );
+    }
+    if (!found.message?.hasMedia) return null;
+    const downloaded = await withInboundDownloadTimeout(
+      this.host.capInboundMediaFor(found.message).then(media => ({ media })),
+      Math.max(0, deadline - Date.now()),
+    );
+    if (!downloaded) {
+      throw new EngineTransportError(
+        `The media of message ${messageId} did not arrive within MEDIA_DOWNLOAD_TIMEOUT_MS`,
+      );
+    }
+    return downloaded.media ?? null;
   }
 
   async deleteMessage(chatId: string, messageId: string, forEveryone: boolean = true): Promise<void> {

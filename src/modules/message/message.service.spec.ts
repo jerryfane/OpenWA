@@ -1,6 +1,6 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
-import { FindOperator, In, Repository } from 'typeorm';
+import { FindOperator, In, Not, Repository } from 'typeorm';
 import { BadRequestException, NotFoundException } from '@nestjs/common';
 import { MessageService, spendInlineMediaBudget } from './message.service';
 import { MessageSendService } from './message-send.service';
@@ -12,6 +12,10 @@ import { HookManager } from '../../core/hooks';
 import { LidMappingStoreService } from '../../engine/identity/lid-mapping-store.service';
 import { LidMapping } from '../../engine/identity/lid-mapping.entity';
 import { SendPacingService } from './send-pacing.service';
+import { EngineTransportError } from '../../common/errors/engine-transport.error';
+import { EngineNotSupportedError } from '../../common/errors/engine-not-supported.error';
+import { MessageNotFoundError } from '../../common/errors/message-not-found.error';
+import { EngineNotReadyError } from '../../common/errors/engine-not-ready.error';
 
 /** The `In([...])` condition a lid-table fake honours; an absent condition matches every row. */
 const inList = (value: string, cond?: FindOperator<string>): boolean =>
@@ -60,6 +64,7 @@ function createMockEngine() {
     unpinMessage: jest.fn().mockResolvedValue(undefined),
     editMessage: jest.fn().mockResolvedValue({ id: 'wa-msg-1', timestamp: 1706868000 }),
     getChatHistory: jest.fn().mockResolvedValue([]),
+    fetchMessageMedia: jest.fn().mockResolvedValue(null),
   };
 }
 
@@ -67,7 +72,11 @@ describe('MessageService', () => {
   let service: MessageService;
   let repository: jest.Mocked<Partial<Repository<Message>>>;
   let engines: EngineRegistry;
-  let messageProjector: { recordOutboundMessageEdit: jest.Mock; recordRevoke: jest.Mock };
+  let messageProjector: {
+    recordOutboundMessageEdit: jest.Mock;
+    recordRevoke: jest.Mock;
+    enqueueMessageMutation: jest.Mock;
+  };
   let hookManager: jest.Mocked<Partial<HookManager>>;
   let lidMappingStore: { findLidsForPhone: jest.Mock; findPhoneForLid: jest.Mock };
   let mockEngine: ReturnType<typeof createMockEngine>;
@@ -88,6 +97,10 @@ describe('MessageService', () => {
     messageProjector = {
       recordOutboundMessageEdit: jest.fn().mockResolvedValue(undefined),
       recordRevoke: jest.fn().mockResolvedValue(undefined),
+      // Runs the work at once: ordering against other writers is the projector's own spec's concern.
+      enqueueMessageMutation: jest.fn((_sessionId: string, _messageId: string, work: () => Promise<void>) => {
+        void work();
+      }),
     };
 
     engines = new EngineRegistry();
@@ -1126,6 +1139,154 @@ describe('MessageService', () => {
       await expect(svc.getChatMedia('sess-1', 'c@c.us', 'wa-1')).resolves.toEqual({
         buffer: Buffer.from('INLINE'),
         mimetype: 'image/jpeg',
+      });
+    });
+
+    // ── on-demand re-fetch: the arrival download failed and left only the marker ──────────
+
+    describe('when the row holds no payload', () => {
+      const JPEG = Buffer.from('JPEG-BYTES');
+      const ENVELOPE = { mimetype: 'image/jpeg', data: JPEG.toString('base64') };
+      const MARKER = { mimetype: 'image/jpeg', omitted: true, sizeBytes: JPEG.length };
+      const omittedRow = (media: unknown = MARKER) => ({
+        id: 'msg-uuid-1',
+        sessionId: 'sess-1',
+        chatId: 'c@c.us',
+        waMessageId: 'wa-1',
+        type: 'image',
+        metadata: { quotedMessage: { id: 'q', body: 'kept' }, ...(media === undefined ? {} : { media }) },
+      });
+      const archive = () => ({
+        getMedia: jest.fn().mockResolvedValue(null),
+        archive: jest.fn().mockResolvedValue('chat-media/sess-1/x.jpg'),
+      });
+
+      it.each([
+        ['the omitted marker', MARKER],
+        ['no media at all', undefined],
+      ])('re-downloads media for %s, keeps it on the row, archives it, and serves it', async (_label, media) => {
+        const row = omittedRow(media);
+        (repository.findOne as jest.Mock).mockResolvedValue(row);
+        mockEngine.fetchMessageMedia.mockResolvedValue(ENVELOPE);
+        const arch = archive();
+        const svc = build(arch, storage());
+
+        await expect(svc.getChatMedia('sess-1', 'c@c.us', 'wa-1')).resolves.toEqual({
+          buffer: JPEG,
+          mimetype: 'image/jpeg',
+        });
+
+        expect(mockEngine.fetchMessageMedia).toHaveBeenCalledWith('c@c.us', 'wa-1');
+        expect(messageProjector.enqueueMessageMutation).toHaveBeenCalledWith('sess-1', 'wa-1', expect.any(Function));
+        const stored = { quotedMessage: { id: 'q', body: 'kept' }, media: ENVELOPE };
+        expect(repository.update).toHaveBeenCalledWith(
+          { id: 'msg-uuid-1', type: Not('revoked') },
+          { metadata: stored },
+        );
+        expect(arch.archive).toHaveBeenCalledWith(expect.objectContaining({ id: 'msg-uuid-1', metadata: stored }));
+        // Row first, then the file: the archive points the row at it, so the row must hold the media.
+        expect((repository.update as jest.Mock).mock.invocationCallOrder[0]).toBeLessThan(
+          arch.archive.mock.invocationCallOrder[0],
+        );
+      });
+
+      it.each([
+        ['nothing', null],
+        ['the omitted marker again', MARKER],
+      ])('404s and writes nothing when the engine returns %s', async (_label, result) => {
+        (repository.findOne as jest.Mock).mockResolvedValue(omittedRow());
+        mockEngine.fetchMessageMedia.mockResolvedValue(result);
+        const arch = archive();
+        const svc = build(arch, storage());
+        await expect(svc.getChatMedia('sess-1', 'c@c.us', 'wa-1')).rejects.toThrow(NotFoundException);
+        expect(mockEngine.fetchMessageMedia).toHaveBeenCalledTimes(1);
+        expect(repository.update).not.toHaveBeenCalled();
+        expect(arch.archive).not.toHaveBeenCalled();
+      });
+
+      it.each([
+        ['the engine lacks the capability (501)', new EngineNotSupportedError('fetchMessageMedia')],
+        ['the engine no longer has the message', new MessageNotFoundError('wa-1', 'c@c.us')],
+        ['the session is not READY yet (409)', new EngineNotReadyError()],
+      ])('404s when %s', async (_label, error) => {
+        (repository.findOne as jest.Mock).mockResolvedValue(omittedRow());
+        mockEngine.fetchMessageMedia.mockRejectedValue(error);
+        const svc = build(archive(), storage());
+        await expect(svc.getChatMedia('sess-1', 'c@c.us', 'wa-1')).rejects.toThrow(NotFoundException);
+      });
+
+      it('404s without an engine call when the session is not running', async () => {
+        (repository.findOne as jest.Mock).mockResolvedValue({ ...omittedRow(), sessionId: 'stopped' });
+        const svc = build(archive(), storage());
+        await expect(svc.getChatMedia('stopped', 'c@c.us', 'wa-1')).rejects.toThrow(NotFoundException);
+        expect(mockEngine.fetchMessageMedia).not.toHaveBeenCalled();
+      });
+
+      it('lets a transport failure through as the 503 the caller retries on', async () => {
+        (repository.findOne as jest.Mock).mockResolvedValue(omittedRow());
+        mockEngine.fetchMessageMedia.mockRejectedValue(new EngineTransportError('page did not answer'));
+        const svc = build(archive(), storage());
+        await expect(svc.getChatMedia('sess-1', 'c@c.us', 'wa-1')).rejects.toBeInstanceOf(EngineTransportError);
+      });
+
+      it.each([
+        ['a revoked row', { ...omittedRow(), type: 'revoked' }],
+        ['a URL send', omittedRow({ mimetype: 'image/png', data: 'https://example.com/cat.png' })],
+      ])('never asks the engine for %s', async (_label, row) => {
+        (repository.findOne as jest.Mock).mockResolvedValue(row);
+        const svc = build(archive(), storage());
+        await expect(svc.getChatMedia('sess-1', 'c@c.us', 'wa-1')).rejects.toThrow(NotFoundException);
+        expect(mockEngine.fetchMessageMedia).not.toHaveBeenCalled();
+      });
+
+      it('404s and keeps nothing when a revoke reached the row while the media downloaded', async () => {
+        (repository.findOne as jest.Mock)
+          .mockResolvedValueOnce(omittedRow())
+          .mockResolvedValueOnce({ ...omittedRow(), type: 'revoked' });
+        mockEngine.fetchMessageMedia.mockResolvedValue(ENVELOPE);
+        const arch = archive();
+        const svc = build(arch, storage());
+        await expect(svc.getChatMedia('sess-1', 'c@c.us', 'wa-1')).rejects.toThrow(NotFoundException);
+        expect(repository.update).not.toHaveBeenCalled();
+        expect(arch.archive).not.toHaveBeenCalled();
+      });
+
+      it('serves the bytes even when keeping them on the row fails', async () => {
+        (repository.findOne as jest.Mock).mockResolvedValue(omittedRow());
+        (repository.update as jest.Mock).mockRejectedValueOnce(new Error('SQLITE_BUSY'));
+        mockEngine.fetchMessageMedia.mockResolvedValue(ENVELOPE);
+        const svc = build(archive(), storage());
+        await expect(svc.getChatMedia('sess-1', 'c@c.us', 'wa-1')).resolves.toEqual({
+          buffer: JPEG,
+          mimetype: 'image/jpeg',
+        });
+      });
+
+      it('shares one download between concurrent requests for the same message', async () => {
+        (repository.findOne as jest.Mock).mockResolvedValue(omittedRow());
+        let release: (media: typeof ENVELOPE) => void = () => undefined;
+        mockEngine.fetchMessageMedia.mockReturnValueOnce(
+          new Promise(resolve => {
+            release = resolve;
+          }),
+        );
+        const svc = build(archive(), storage());
+
+        const first = svc.getChatMedia('sess-1', 'c@c.us', 'wa-1');
+        const second = svc.getChatMedia('sess-1', 'c@c.us', 'wa-1');
+        // Let both requests reach the engine call before the download finishes.
+        await new Promise(resolve => setImmediate(resolve));
+        release(ENVELOPE);
+
+        const expected = { buffer: JPEG, mimetype: 'image/jpeg' };
+        await expect(Promise.all([first, second])).resolves.toEqual([expected, expected]);
+        expect(mockEngine.fetchMessageMedia).toHaveBeenCalledTimes(1);
+        expect(repository.update).toHaveBeenCalledTimes(1);
+
+        // Settled downloads leave the map: a later read asks again rather than replaying a result.
+        mockEngine.fetchMessageMedia.mockResolvedValueOnce(null);
+        await expect(svc.getChatMedia('sess-1', 'c@c.us', 'wa-1')).rejects.toThrow(NotFoundException);
+        expect(mockEngine.fetchMessageMedia).toHaveBeenCalledTimes(2);
       });
     });
   });
