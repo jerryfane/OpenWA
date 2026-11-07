@@ -32,7 +32,7 @@ import { buildVCard } from './vcard';
 import { EngineNotSupportedError } from '../../common/errors/engine-not-supported.error';
 import { RecipientUnreachableError } from '../../common/errors/recipient-unreachable.error';
 import { type WwebjsEngineHost, withPage } from './wwebjs-host';
-import { toCapturedPageError } from './wwebjs-lifecycle';
+import { isProtocolTimeout, toCapturedPageError } from './wwebjs-lifecycle';
 
 /**
  * Map a whatsapp-web.js MessageAck integer to the neutral DeliveryStatus.
@@ -884,9 +884,12 @@ export class WwebjsMessaging {
    * lookup and the download share ONE MEDIA_DOWNLOAD_TIMEOUT_MS deadline. Missing it is an
    * EngineTransportError (503: WhatsApp Web left the query unanswered), never null, which the caller
    * would read as "the media is gone". It is not reported as a page death: a slow page is not a dead one.
+   * A puppeteer protocol timeout that fires first (PUPPETEER_PROTOCOL_TIMEOUT_MS below the media
+   * deadline) is the same unanswered query, so it is the same 503, as in the chat/contact read helpers.
    *
-   * The download goes through capInboundMediaFor, so the declared-size gate, the inbound concurrency
-   * slots shared with arrival traffic, and the size cap all apply unchanged.
+   * The download goes through capInboundMediaFor with the remaining deadline, so the declared-size
+   * gate, the inbound concurrency slots shared with arrival traffic, and the size cap all apply
+   * unchanged, and a download still queued when the deadline passes never starts.
    */
   async fetchMessageMedia(chatId: string, messageId: string): Promise<IncomingMessage['media'] | null> {
     this.host.ensureReady();
@@ -901,6 +904,11 @@ export class WwebjsMessaging {
         if (error instanceof MessageNotFoundError) return null;
         throw error;
       });
+    }).catch((error: unknown) => {
+      if (isProtocolTimeout(error)) {
+        throw new EngineTransportError(`WhatsApp Web did not answer in time while looking up message ${messageId}`);
+      }
+      throw error;
     });
     // Boxed so the timeout's null cannot be mistaken for "no such message".
     const found = await withInboundDownloadTimeout(
@@ -913,16 +921,8 @@ export class WwebjsMessaging {
       );
     }
     if (!found.message?.hasMedia) return null;
-    const downloaded = await withInboundDownloadTimeout(
-      this.host.capInboundMediaFor(found.message).then(media => ({ media })),
-      Math.max(0, deadline - Date.now()),
-    );
-    if (!downloaded) {
-      throw new EngineTransportError(
-        `The media of message ${messageId} did not arrive within MEDIA_DOWNLOAD_TIMEOUT_MS`,
-      );
-    }
-    return downloaded.media ?? null;
+    // capInboundMediaFor waits only until the shared deadline and throws EngineTransportError past it.
+    return (await this.host.capInboundMediaFor(found.message, undefined, deadline)) ?? null;
   }
 
   async deleteMessage(chatId: string, messageId: string, forEveryone: boolean = true): Promise<void> {

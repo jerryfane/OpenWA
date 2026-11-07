@@ -33,6 +33,8 @@ import { MessageNotFoundError } from '../../common/errors/message-not-found.erro
 import { type createLogger } from '../../common/services/logger.service';
 import { EngineTransportError } from '../../common/errors/engine-transport.error';
 import { BAILEYS_QUERY_BUDGET_MS, withQueryDeadline } from './baileys-query-deadline';
+import { inboundMediaTimeoutMs, withInboundDownloadTimeout } from './inbound-media-cap';
+import type { ConcurrencyLimiter } from '../../common/utils/concurrency-limiter';
 
 /**
  * Messaging-domain operations extracted from BaileysAdapter. The adapter keeps the public
@@ -83,8 +85,10 @@ export interface BaileysMessagingHost {
   mapMessage(
     msg: WAMessage,
     contentType: string | undefined,
-    opts?: { skipMediaDownload?: boolean },
+    opts?: { skipMediaDownload?: boolean; mediaDeadlineAt?: number },
   ): Promise<IncomingMessage>;
+  /** This session's inbound media slots (INBOUND_MEDIA_CONCURRENCY), shared with arrival downloads. */
+  readonly inboundLimiter: ConcurrencyLimiter;
 }
 
 /** RIFF….WEBP magic. Sniffed from the bytes, because the declared label may be the DTO's placeholder. */
@@ -847,19 +851,44 @@ export class BaileysMessaging {
    * Download one stored message's media again, on demand (see IWhatsAppEngine.fetchMessageMedia).
    *
    * The raw WAMessage the session stored on arrival still holds the media key and CDN path, so the
-   * inbound mapper re-runs the same capped download arrival ran — declared-size gate, inbound slots,
-   * MEDIA_DOWNLOAD_TIMEOUT_MS deadline, and the phone re-upload for media the CDN expired. The store
-   * is keyed by message id alone; the caller has already matched the id to its chat. Null without a
-   * store, for a message the store does not hold or that was deleted for everyone, and for a message
-   * with no media.
+   * inbound mapper re-runs the same capped download arrival ran — declared-size gate, the phone
+   * re-upload for media the CDN expired — under the session's inbound slot and the process-wide gate,
+   * exactly like arrival (handleMessagesUpsert), so concurrent re-fetches of different messages stay
+   * within INBOUND_MEDIA_CONCURRENCY. ONE MEDIA_DOWNLOAD_TIMEOUT_MS deadline spans the store lookup,
+   * the slot wait and the download; missing it is an EngineTransportError (503, retry), never the
+   * omitted marker the caller would read as "no media". Work still queued when the deadline passes
+   * gives its slot straight back instead of downloading for nobody. The store is keyed by message id
+   * alone; the caller has already matched the id to its chat. Null without a store, for a message
+   * the store does not hold or that was deleted for everyone, and for a message with no media.
    */
   async fetchMessageMedia(_chatId: string, messageId: string): Promise<IncomingMessage['media'] | null> {
     this.host.ensureReady();
-    const stored = await this.host.getStoredMessage(messageId);
+    const deadlineAt = Date.now() + inboundMediaTimeoutMs();
+    const expiredMessage = `The media of message ${messageId} did not arrive within MEDIA_DOWNLOAD_TIMEOUT_MS`;
+    // Boxed so the timeout's null cannot be mistaken for "no such message".
+    const lookup = await withInboundDownloadTimeout(
+      Promise.resolve(this.host.getStoredMessage(messageId)).then(stored => ({ stored })),
+      Math.max(0, deadlineAt - Date.now()),
+    );
+    if (!lookup) throw new EngineTransportError(expiredMessage);
+    const { stored } = lookup;
     if (!stored?.message || !stored.key || this.host.wasDeletedForEveryone(messageId)) return null;
     const b = await this.host.loadLib();
     const contentType = b.getContentType(b.normalizeMessageContent(stored.message) ?? stored.message);
-    return (await this.host.mapMessage(stored, contentType)).media ?? null;
+    let gaveUp = false;
+    const mapped = await withInboundDownloadTimeout(
+      this.host.inboundLimiter.run(async () => {
+        if (gaveUp || Date.now() >= deadlineAt) return null;
+        const message = await this.host.mapMessage(stored, contentType, { mediaDeadlineAt: deadlineAt });
+        return { media: message.media };
+      }),
+      Math.max(0, deadlineAt - Date.now()),
+      () => {
+        gaveUp = true;
+      },
+    );
+    if (!mapped) throw new EngineTransportError(expiredMessage);
+    return mapped.media ?? null;
   }
 
   /**

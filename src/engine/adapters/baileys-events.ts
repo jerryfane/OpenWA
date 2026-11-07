@@ -29,6 +29,7 @@ import {
 import { buildEditedMessage } from './message-mapper';
 import { toUnixSeconds } from './baileys-history';
 import { EngineNotReadyError } from '../../common/errors/engine-not-ready.error';
+import { EngineTransportError } from '../../common/errors/engine-transport.error';
 import { CallNotFoundError } from '../../common/errors/call-not-found.error';
 import {
   capInboundMedia,
@@ -1223,6 +1224,7 @@ export class BaileysEvents {
   private async downloadInboundMediaCapped(
     msg: WAMessage,
     maxBytes: number,
+    timeoutMs: number = inboundMediaTimeoutMs(),
   ): Promise<Buffer | { overflowBytes: number } | null> {
     // A proxied session must not fetch media around its proxy (#859). Baileys reads the dispatcher
     // from the nested `options`; a top-level one is ignored.
@@ -1298,7 +1300,7 @@ export class BaileysEvents {
     // A slow/trickling sender never trips the byte cap, so without a deadline it pins a concurrency
     // slot (and, on Baileys, the whole inbound handler) indefinitely. On timeout, destroy the stream
     // and treat it as no usable media.
-    return withInboundDownloadTimeout(download, inboundMediaTimeoutMs(), () => {
+    return withInboundDownloadTimeout(download, timeoutMs, () => {
       timedOut = true;
       stream?.destroy?.();
       releaseSlot();
@@ -1320,6 +1322,7 @@ export class BaileysEvents {
     content: NonNullable<WAMessage['message']>,
     b: typeof BaileysLib,
     skipMediaDownload: boolean,
+    mediaDeadlineAt?: number,
   ): Promise<IncomingMessage['media']> {
     const isMediaType =
       contentType === 'imageMessage' ||
@@ -1385,8 +1388,19 @@ export class BaileysEvents {
     try {
       // Stream-download with a running-total abort so a sender who understates fileLength still
       // can't materialise an over-cap blob. For under-cap media this yields the identical buffer.
-      const buf = await this.downloadInboundMediaCapped(msg, maxBytes);
+      const buf = await this.downloadInboundMediaCapped(
+        msg,
+        maxBytes,
+        mediaDeadlineAt === undefined ? inboundMediaTimeoutMs() : Math.max(0, mediaDeadlineAt - Date.now()),
+      );
       if (buf === null) {
+        // An on-demand re-fetch owns a caller deadline: missing it is a retryable transport failure,
+        // not "this message has no media" (which the omitted marker would tell the caller).
+        if (mediaDeadlineAt !== undefined) {
+          throw new EngineTransportError(
+            `The media of message ${msg.key.id} did not arrive within MEDIA_DOWNLOAD_TIMEOUT_MS`,
+          );
+        }
         // Nothing proves the real size, so report the declared one, as the failure branch below does.
         this.host.logger.warn('Inbound media download passed MEDIA_DOWNLOAD_TIMEOUT_MS; emitting omitted marker', {
           msgId: msg.key.id,
@@ -1413,6 +1427,7 @@ export class BaileysEvents {
         toBase64: () => buf.toString('base64'),
       });
     } catch (err) {
+      if (err instanceof EngineTransportError && mediaDeadlineAt !== undefined) throw err;
       // A download failure yields the omitted marker, never a propagated throw: the media field stays
       // present, matching the skip/pre-gate/abort exits above. The declared size is the honest number
       // here: the download never completed, so no measured size exists.
@@ -1427,7 +1442,11 @@ export class BaileysEvents {
   async mapMessage(
     msg: WAMessage,
     contentType: string | undefined,
-    opts?: { skipMediaDownload?: boolean },
+    /**
+     * `mediaDeadlineAt` (epoch ms) is the on-demand re-fetch's deadline: the download gets only the
+     * time left, and missing it throws EngineTransportError instead of emitting the omitted marker.
+     */
+    opts?: { skipMediaDownload?: boolean; mediaDeadlineAt?: number },
   ): Promise<IncomingMessage> {
     const b = await this.host.loadLib();
     const content = msg.message ?? {};
@@ -1440,7 +1459,14 @@ export class BaileysEvents {
     // Body: text first, then media caption, then WhatsApp Business interactive shapes (#562).
     const body = extractBaileysBody(normalized);
     const location = extractBaileysLocation(normalized, contentType);
-    const media = await this.resolveInboundMedia(msg, contentType, content, b, opts?.skipMediaDownload === true);
+    const media = await this.resolveInboundMedia(
+      msg,
+      contentType,
+      content,
+      b,
+      opts?.skipMediaDownload === true,
+      opts?.mediaDeadlineAt,
+    );
     // The quote, the disappearing-messages timer, the mentions and the status styling all come from
     // one region of the content — see BaileysMessageContext.
     const context = extractBaileysContext(normalized);

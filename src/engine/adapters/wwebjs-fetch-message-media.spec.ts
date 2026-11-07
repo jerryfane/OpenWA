@@ -3,6 +3,9 @@ import { WwebjsMessaging } from './wwebjs-messaging';
 import { createLogger } from '../../common/services/logger.service';
 import { type WwebjsEngineHost } from './wwebjs-host';
 import { EngineTransportError } from '../../common/errors/engine-transport.error';
+import { ConcurrencyLimiter } from '../../common/utils/concurrency-limiter';
+import { WhatsAppWebJsAdapter } from './whatsapp-web-js.adapter';
+import { inboundMediaConcurrency } from './inbound-media-cap';
 
 /**
  * fetchMessageMedia is the recovery path for a message whose arrival download failed: it looks the
@@ -30,7 +33,7 @@ function setup(opts: { byId?: unknown; window?: unknown[]; cap?: jest.Mock } = {
     capInboundMediaFor,
     logger,
   } as unknown as WwebjsEngineHost;
-  return { messaging: new WwebjsMessaging(host), client, capInboundMediaFor };
+  return { messaging: new WwebjsMessaging(host), client, capInboundMediaFor, host };
 }
 
 const mediaMessage = (id = SERIALIZED) =>
@@ -50,7 +53,7 @@ describe('WwebjsMessaging.fetchMessageMedia', () => {
     await expect(messaging.fetchMessageMedia(CHAT, SERIALIZED)).resolves.toEqual(ENVELOPE);
     expect(client.getMessageById).toHaveBeenCalledWith(SERIALIZED);
     expect(client.getChatById).not.toHaveBeenCalled();
-    expect(capInboundMediaFor).toHaveBeenCalledWith(msg);
+    expect(capInboundMediaFor).toHaveBeenCalledWith(msg, undefined, expect.any(Number));
   });
 
   it('passes the omitted marker through when the download fails again', async () => {
@@ -102,16 +105,50 @@ describe('WwebjsMessaging.fetchMessageMedia', () => {
     jest.useFakeTimers();
     process.env.MEDIA_DOWNLOAD_TIMEOUT_MS = '1000';
     const msg = mediaMessage();
-    const { messaging, client } = setup({ cap: jest.fn().mockReturnValue(new Promise(() => undefined)) });
+    const { messaging, client, capInboundMediaFor } = setup();
     client.getMessageById.mockImplementation(() => new Promise(resolve => setTimeout(() => resolve(msg), 700)));
-    let failedAt = -1;
     const started = Date.now();
-    const settled = messaging.fetchMessageMedia(CHAT, SERIALIZED).catch((error: unknown) => {
-      failedAt = Date.now() - started;
-      return error;
+    const settled = messaging.fetchMessageMedia(CHAT, SERIALIZED);
+    await jest.advanceTimersByTimeAsync(700);
+    await expect(settled).resolves.toEqual(ENVELOPE);
+    // The download is handed the deadline the lookup started, not a fresh one.
+    expect(capInboundMediaFor).toHaveBeenCalledWith(msg, undefined, started + 1000);
+  });
+
+  it('answers 503 when puppeteer protocolTimeout fails the lookup first, without reporting a page death', async () => {
+    const reportIfPageTransportError = jest.fn();
+    const { messaging, client, host } = setup();
+    Object.assign(host, { reportIfPageTransportError });
+    client.getMessageById.mockRejectedValue(
+      new Error("Runtime.callFunctionOn timed out. Increase the 'protocolTimeout' setting in launch/connect calls"),
+    );
+    await expect(messaging.fetchMessageMedia(CHAT, SERIALIZED)).rejects.toBeInstanceOf(EngineTransportError);
+    expect(reportIfPageTransportError).not.toHaveBeenCalled();
+  });
+
+  // Through the production capInboundMediaFor and session limiter: a slot freed after the caller
+  // already got its 503 must not start the abandoned download.
+  it('never starts a queued download once the shared deadline has passed', async () => {
+    process.env.MEDIA_DOWNLOAD_TIMEOUT_MS = '200';
+    const adapter = new WhatsAppWebJsAdapter({ sessionId: 's', sessionDataPath: './data/sessions', puppeteer: {} });
+    const internals = adapter as unknown as {
+      inboundLimiter: ConcurrencyLimiter;
+      capInboundMediaFor: WwebjsEngineHost['capInboundMediaFor'];
+    };
+    const holders: Array<() => void> = [];
+    for (let i = 0; i < inboundMediaConcurrency(); i++) {
+      void internals.inboundLimiter.run(() => new Promise<void>(resolve => holders.push(resolve)));
+    }
+    const downloadMedia = jest.fn().mockResolvedValue({ mimetype: 'image/jpeg', data: 'SlBFRw==' });
+    const msg = { hasMedia: true, id: { _serialized: SERIALIZED }, _data: { size: 4 }, downloadMedia };
+    const { messaging, client } = setup({
+      cap: jest.fn((m: Message, o?: number, d?: number) => internals.capInboundMediaFor(m, o, d)),
     });
-    await jest.advanceTimersByTimeAsync(1000);
-    await expect(settled).resolves.toBeInstanceOf(EngineTransportError);
-    expect(failedAt).toBe(1000);
+    client.getMessageById.mockImplementation(() => new Promise(resolve => setTimeout(() => resolve(msg), 120)));
+    await expect(messaging.fetchMessageMedia(CHAT, SERIALIZED)).rejects.toBeInstanceOf(EngineTransportError);
+    // Every slot was held, so admit the queued task only now, after the caller's 503.
+    for (const release of holders) release();
+    await new Promise(resolve => setTimeout(resolve, 150));
+    expect(downloadMedia).not.toHaveBeenCalled();
   });
 });
