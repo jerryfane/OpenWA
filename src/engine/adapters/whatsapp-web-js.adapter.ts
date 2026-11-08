@@ -320,9 +320,9 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     // would admit a fresh download while the abandoned one is still materialising in heap — letting the
     // number of in-flight downloads exceed inboundMediaConcurrency(). Instead, HOLD the slot until the real
     // download settles; the caller still unblocks on the timeout race and emits the message without media.
-    // boundedReady adopts the timeout-bounded race (a Promise resolving a Promise flattens), so awaiting it
-    // unblocks the caller once the task is admitted AND the deadline-or-download settles — yielding the
-    // media or null on timeout.
+    // boundedReady adopts the timeout-bounded race (the bare download on demand; a Promise resolving a
+    // Promise flattens), so awaiting it unblocks the caller once the task is admitted AND the
+    // deadline-or-download settles — yielding the media or null on timeout.
     let resolveBounded: (value: MessageMedia | null | PromiseLike<MessageMedia | null>) => void = () => undefined;
     const boundedReady = new Promise<MessageMedia | null>(resolve => {
       resolveBounded = resolve;
@@ -349,15 +349,22 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
         });
         return null;
       });
+      // An arrival download gets its own MEDIA_DOWNLOAD_TIMEOUT_MS race. An on-demand one does not: that
+      // full-length timer starts at admission, so it can never expire before the caller's deadline
+      // below, only in the same tick when the lookup and the slot took under a millisecond. Registered
+      // first, it would then win with a null that reads as "no media" (404) instead of the missed
+      // deadline (503) it is. The deadline alone bounds the wait, so a download pending there is a 503.
       resolveBounded(
-        withInboundDownloadTimeout(download, inboundMediaTimeoutMs(), () =>
-          this.logger.warn(
-            'Inbound media download timed out (MEDIA_DOWNLOAD_TIMEOUT_MS); emitting message without media',
-            {
-              msgId,
-            },
-          ),
-        ),
+        deadlineAt !== undefined
+          ? download
+          : withInboundDownloadTimeout(download, inboundMediaTimeoutMs(), () =>
+              this.logger.warn(
+                'Inbound media download timed out (MEDIA_DOWNLOAD_TIMEOUT_MS); emitting message without media',
+                {
+                  msgId,
+                },
+              ),
+            ),
       );
       // Keep the slot occupied until the underlying download truly settles, not the timeout race.
       return download.then(

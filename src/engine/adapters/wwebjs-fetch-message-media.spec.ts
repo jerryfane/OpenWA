@@ -41,11 +41,21 @@ const mediaMessage = (id = SERIALIZED) =>
 
 describe('WwebjsMessaging.fetchMessageMedia', () => {
   const saved = process.env.MEDIA_DOWNLOAD_TIMEOUT_MS;
+  const savedMaxBytes = process.env.MEDIA_DOWNLOAD_MAX_BYTES;
   afterEach(() => {
     jest.useRealTimers();
     if (saved === undefined) delete process.env.MEDIA_DOWNLOAD_TIMEOUT_MS;
     else process.env.MEDIA_DOWNLOAD_TIMEOUT_MS = saved;
+    if (savedMaxBytes === undefined) delete process.env.MEDIA_DOWNLOAD_MAX_BYTES;
+    else process.env.MEDIA_DOWNLOAD_MAX_BYTES = savedMaxBytes;
   });
+
+  /** fetchMessageMedia wired to the production capInboundMediaFor of a fresh adapter. */
+  const throughAdapter = () => {
+    const adapter = new WhatsAppWebJsAdapter({ sessionId: 's', sessionDataPath: './data/sessions', puppeteer: {} });
+    const internals = adapter as unknown as { capInboundMediaFor: WwebjsEngineHost['capInboundMediaFor'] };
+    return setup({ cap: jest.fn((m: Message, o?: number, d?: number) => internals.capInboundMediaFor(m, o, d)) });
+  };
 
   it('looks a serialized id up with getMessageById and runs the capped arrival download', async () => {
     const msg = mediaMessage();
@@ -150,5 +160,41 @@ describe('WwebjsMessaging.fetchMessageMedia', () => {
     for (const release of holders) release();
     await new Promise(resolve => setTimeout(resolve, 150));
     expect(downloadMedia).not.toHaveBeenCalled();
+  });
+
+  // A lookup that answers in the millisecond the deadline was taken admits the download at once, so
+  // the download's own MEDIA_DOWNLOAD_TIMEOUT_MS timer and the shared deadline expire in the same
+  // tick. A download still pending then missed the deadline: 503, never the omitted marker the
+  // caller reads as "this message has no media" (404).
+  it('answers 503 when a stalled download and the shared deadline expire in the same tick', async () => {
+    jest.useFakeTimers();
+    process.env.MEDIA_DOWNLOAD_TIMEOUT_MS = '40';
+    let finish: (media: { mimetype: string; data: string }) => void = () => undefined;
+    const downloadMedia = jest.fn(() => new Promise<{ mimetype: string; data: string }>(resolve => (finish = resolve)));
+    const msg = { hasMedia: true, id: { _serialized: SERIALIZED }, _data: { size: 4 }, downloadMedia };
+    const { messaging, client } = throughAdapter();
+    client.getMessageById.mockResolvedValue(msg);
+    const settled = expect(messaging.fetchMessageMedia(CHAT, SERIALIZED)).rejects.toBeInstanceOf(EngineTransportError);
+    await jest.advanceTimersByTimeAsync(40);
+    await settled;
+    expect(downloadMedia).toHaveBeenCalledTimes(1);
+    // Let the late download settle so it hands its slot back.
+    finish({ mimetype: 'image/jpeg', data: 'SlBFRw==' });
+    await jest.advanceTimersByTimeAsync(0);
+  });
+
+  // Media over MEDIA_DOWNLOAD_MAX_BYTES is not coming back on a retry: the omitted marker (404), not 503.
+  it.each([
+    ['declares a size over the cap', 64, 'SlBFRw=='],
+    ['downloads over the cap', 4, Buffer.alloc(64).toString('base64')],
+  ])('resolves the omitted marker for media that %s', async (_label, declared, data) => {
+    process.env.MEDIA_DOWNLOAD_MAX_BYTES = '16';
+    const downloadMedia = jest.fn().mockResolvedValue({ mimetype: 'image/jpeg', data });
+    const msg = { hasMedia: true, id: { _serialized: SERIALIZED }, _data: { size: declared }, downloadMedia };
+    const { messaging, client } = throughAdapter();
+    client.getMessageById.mockResolvedValue(msg);
+    await expect(messaging.fetchMessageMedia(CHAT, SERIALIZED)).resolves.toEqual(
+      expect.objectContaining({ omitted: true }),
+    );
   });
 });
